@@ -164,8 +164,12 @@ int TransformVideo(const char *in_filename,
     /* These properties can be changed for output
      * streams easily using filters */
      // if (dec_ctx->codec_type == AVMEDIA_TYPE_VIDEO) {
-    enc_ctx->height = videoCodecContext->height * upscale / downscale;
-    enc_ctx->width = videoCodecContext->width * upscale / downscale;
+
+    const auto out_height = (videoCodecContext->height * upscale / downscale) & ~7;
+    const auto out_width = (videoCodecContext->width * upscale / downscale) & ~7;
+
+    enc_ctx->height = out_height;
+    enc_ctx->width = out_width;
     enc_ctx->sample_aspect_ratio = videoCodecContext->sample_aspect_ratio;
 
     /* take first format from list of supported formats */
@@ -212,8 +216,8 @@ int TransformVideo(const char *in_filename,
 
     AVFramePtr videoFrameOut(av_frame_alloc());
     videoFrameOut->format = videoCodecContext->pix_fmt;
-    videoFrameOut->width = videoCodecContext->width * upscale / downscale;
-    videoFrameOut->height = videoCodecContext->height * upscale / downscale;
+    videoFrameOut->width = out_width;
+    videoFrameOut->height = out_height;
     av_frame_get_buffer(videoFrameOut.get(), 16);
 
     while (true) {
@@ -247,7 +251,7 @@ int TransformVideo(const char *in_filename,
                 avEncodedPacket.size = 0;
 
 
-                cv::Mat img(videoFrame->height * upscale / downscale, videoFrame->width * upscale / downscale, CV_8UC3);// , pFrameRGB->data[0]); //dst->data[0]);
+                cv::Mat img(out_height, out_width, CV_8UC3);// , pFrameRGB->data[0]); //dst->data[0]);
 
                 int stride = img.step[0];
 
@@ -257,8 +261,8 @@ int TransformVideo(const char *in_filename,
                     videoCodecContext->width,
                     videoCodecContext->height,
                     videoCodecContext->pix_fmt,
-                    videoCodecContext->width * upscale / downscale,
-                    videoCodecContext->height * upscale / downscale,
+                    out_width,
+                    out_height,
                     AV_PIX_FMT_BGR24,
                     SWS_FAST_BILINEAR, NULL, NULL, NULL);
 
@@ -274,11 +278,11 @@ int TransformVideo(const char *in_filename,
 
                 auto reverse_convert_ctx = sws_getCachedContext(
                     NULL,
-                    videoCodecContext->width * upscale / downscale,
-                    videoCodecContext->height * upscale / downscale,
+                    out_width,
+                    out_height,
                     AV_PIX_FMT_YUYV422,
-                    videoCodecContext->width * upscale / downscale,
-                    videoCodecContext->height * upscale / downscale,
+                    out_width,
+                    out_height,
                     videoCodecContext->pix_fmt,
                     SWS_FAST_BILINEAR, NULL, NULL, NULL);
 
@@ -286,7 +290,7 @@ int TransformVideo(const char *in_filename,
                     &img.data,
                     &stride,
                     //&videoFrame->width,
-                    0, videoCodecContext->height * upscale / downscale, //pFrameRGB->data, pFrameRGB->linesize);
+                    0, out_height, //pFrameRGB->data, pFrameRGB->linesize);
                     //(uint8_t*)
                     videoFrameOut->data, videoFrameOut->linesize
                 );

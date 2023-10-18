@@ -30,10 +30,14 @@ find_package(pybind11 CONFIG REQUIRED)
 find_package(FFMPEG QUIET) 
 
 
+add_subdirectory(cvnp)
+
+
 add_executable(mov2mov
                main.cpp  TransformVideo.cpp)
 target_include_directories(mov2mov PRIVATE ${Python3_INCLUDE_DIRS} ) #  ${Python3_INCLUDE_DIRS}/cpython )
 target_link_libraries(mov2mov PRIVATE
+                      cvnp
                       pybind11::lto pybind11::embed pybind11::module pybind11::headers
                       #Python3::Python
                       ${Python3_LIBRARIES}

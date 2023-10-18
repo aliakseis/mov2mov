@@ -1,6 +1,7 @@
 import torch # for backend
 import requests # for internet access
 from PIL import Image # regular python library for image processing
+import numpy as np
 
 from diffusers import StableDiffusionDepth2ImgPipeline # Hugging face pipeline
 
@@ -17,8 +18,11 @@ pipe.enable_sequential_cpu_offload()
 pipe.enable_xformers_memory_efficient_attention()
 pipe.enable_attention_slicing()
 
-def process_image(img):
+def process_image(numpy_image):
     #img = img.resize((1920 // 2, 1080 // 2))
+    img = Image.fromarray(numpy_image.astype('uint8'), 'RGB')
     prompt = "photorealistic characters, beautiful" #"same content, characters made realistic"
     negative_prompt = "bad anatomy, bad proportions, deformed, ugly, missing arms, missing legs, extra arms, extra legs, extra fingers, extra limbs, out of frame"
-    return pipe(prompt=prompt, image=img, negative_prompt=negative_prompt, strength=0.3).images[0]
+    outcome = pipe(prompt=prompt, image=img, negative_prompt=negative_prompt, strength=0.3)
+    result = outcome.images[0]
+    return np. array(result)

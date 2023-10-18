@@ -14,6 +14,8 @@
 #include <pybind11/embed.h>
 #include <pybind11/numpy.h>
 
+#include "cvnp/cvnp.h"
+
 #include <functional>
 #include <iostream>
 
@@ -173,14 +175,18 @@ int main(int argc, char **argv)
 
         auto lam = [&fun](cv::Mat& image) {
             // Convert the OpenCV image to a numpy array
-            py::array_t<uint8_t> numpy_image(image.total()* image.elemSize(),
-                image.data);
+            //py::array_t<uint8_t> numpy_image(image.total()* image.elemSize(),
+            //    image.data);
+
+            auto numpy_image = cvnp::mat_to_nparray(image);
 
             // Call the Python function with the numpy array as an argument
-            py::array_t<uint8_t> output_image = fun(numpy_image);
+            //py::array_t<uint8_t> 
+            py::array output_image = fun(numpy_image);
 
             // Convert the returned numpy array back to an OpenCV image
-            cv::Mat processed_image(image.size(), CV_8UC3, const_cast<uint8_t*>(output_image.data()));
+            //cv::Mat processed_image(image.size(), CV_8UC3, const_cast<uint8_t*>(output_image.data()));
+            auto processed_image = cvnp::nparray_to_mat(output_image);
             image = processed_image.clone();
         };
 
