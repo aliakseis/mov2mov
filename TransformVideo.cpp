@@ -40,7 +40,7 @@ int TransformVideo(const char *in_filename,
     int ret;
     int stream_index = 0;
 
-    AVDictionary* opts = NULL;
+    //AVDictionary* opts = NULL;
 
 
     if ((ret = avformat_open_input(&input_format_context, in_filename, NULL, NULL)) < 0) {
@@ -56,7 +56,7 @@ int TransformVideo(const char *in_filename,
         return 1;
     }
 
-    avformat_alloc_output_context2(&output_format_context, NULL, NULL, out_filename);
+    avformat_alloc_output_context2(&output_format_context, NULL, "matroska", out_filename);
     if (!output_format_context) {
         fprintf(stderr, "Could not create output context\n");
         ret = AVERROR_UNKNOWN;
@@ -102,11 +102,17 @@ int TransformVideo(const char *in_filename,
             return 1;
         }
 
+        out_stream->codecpar->codec_tag = 0;
+
         if (isVideoStream)
         {
             outputVideoStream = out_stream;
         }
     }
+
+    output_format_context->flags |= AVFMT_FLAG_NOBUFFER | AVFMT_FLAG_FLUSH_PACKETS;
+    output_format_context->flush_packets = 1;
+
     // https://ffmpeg.org/doxygen/trunk/group__lavf__misc.html#gae2645941f2dc779c307eb6314fd39f10
     av_dump_format(output_format_context, 0, out_filename, 1);
 
@@ -186,6 +192,9 @@ int TransformVideo(const char *in_filename,
     if (enc_ctx->qmin > enc_ctx->qmax)
         enc_ctx->qmin = enc_ctx->qmax;
 
+    enc_ctx->gop_size = 1;
+    enc_ctx->max_b_frames = 2;
+
     /* Third parameter can be used to pass settings to encoder */
     ret = avcodec_open2(enc_ctx, encoder, NULL);
     if (ret < 0) {
@@ -200,11 +209,25 @@ int TransformVideo(const char *in_filename,
     }
     outputVideoStream->time_base = enc_ctx->time_base;
 
+    AVDictionary* opts = NULL;
 
     //if (fragmented_mp4_options) {
-    //    // https://developer.mozilla.org/en-US/docs/Web/API/Media_Source_Extensions_API/Transcoding_assets_for_MSE
-    //    av_dict_set(&opts, "movflags", "frag_keyframe+empty_moov+default_base_moof", 0);
+        // https://developer.mozilla.org/en-US/docs/Web/API/Media_Source_Extensions_API/Transcoding_assets_for_MSE
+        //av_dict_set(&opts, "movflags", "frag_keyframe+empty_moov+default_base_moof", 0);
+        //av_dict_set(&opts, "movflags", "frag_keyframe+empty_moov", 0);
     //}
+
+    //av_dict_set(&opts, "blocksize", "2048", 0);
+    av_dict_set(&opts, "flush_packets", "1", 0);
+
+#if 0
+    //av_dict_set(&opts, "bf", "0", 0);
+    av_dict_set(&opts, "g", "2", 0);
+
+    av_dict_set(&opts, "probesize", "200000", 0);
+    av_dict_set(&opts, "frag_duration", "100", 0);
+#endif
+
     // https://ffmpeg.org/doxygen/trunk/group__lavf__encoding.html#ga18b7b10bb5b94c4842de18166bc677cb
     ret = avformat_write_header(output_format_context, &opts);
     if (ret < 0) {
@@ -280,7 +303,7 @@ int TransformVideo(const char *in_filename,
                     NULL,
                     out_width,
                     out_height,
-                    AV_PIX_FMT_YUYV422,
+                    AV_PIX_FMT_BGR24,
                     out_width,
                     out_height,
                     videoCodecContext->pix_fmt,

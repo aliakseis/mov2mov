@@ -188,6 +188,8 @@ int main(int argc, char **argv)
             //cv::Mat processed_image(image.size(), CV_8UC3, const_cast<uint8_t*>(output_image.data()));
             auto processed_image = cvnp::nparray_to_mat(output_image);
             image = processed_image.clone();
+            cv::imshow("Output", image);
+            cv::waitKey(1);
         };
 
         return TransformVideo(input.c_str(), output.c_str(), lam, 1, downscale);
