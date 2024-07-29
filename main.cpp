@@ -55,7 +55,7 @@ int main(int argc, char **argv)
 
         //const auto modelName = parser.get<cv::String>("m");
         const auto modelFile = parser.get<cv::String>("f");
-        enum { downscale = 2 };//parser.get<int>("u");
+        enum { downscale = 1 };//parser.get<int>("u");
 
         // Import the python script
         //py::module python_script = py::exec(modelFile.c_str());

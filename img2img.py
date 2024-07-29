@@ -10,7 +10,7 @@ pipe = StableDiffusionDepth2ImgPipeline.from_pretrained(
     "stabilityai/stable-diffusion-2-depth",
     torch_dtype=torch.float16,
     use_safetensors=True,
-    local_files_only=True,
+    #local_files_only=True,
 ).to("cuda") #  Assigning to GPU
 
 pipe.enable_sequential_cpu_offload()
@@ -21,8 +21,9 @@ pipe.enable_attention_slicing()
 def process_image(numpy_image):
     #img = img.resize((1920 // 2, 1080 // 2))
     img = Image.fromarray(numpy_image.astype('uint8'), 'RGB')
-    prompt = "photorealistic characters, beautiful" #"same content, characters made realistic"
-    negative_prompt = "bad anatomy, bad proportions, deformed, ugly, missing arms, missing legs, extra arms, extra legs, extra fingers, extra limbs, out of frame"
-    outcome = pipe(prompt=prompt, image=img, negative_prompt=negative_prompt, strength=0.3)
+    prompt = "detailed, beautiful" #"same content, characters made realistic"
+    negative_prompt = "bad anatomy, bad proportions, deformed, ugly, missing arms, missing legs, extra arms, extra legs, extra fingers, extra limbs, bad faces, ugly faces"
+    generator = torch.Generator(device="cuda").manual_seed(21)
+    outcome = pipe(prompt=prompt, image=img, negative_prompt=negative_prompt, strength=0.15, generator=generator)
     result = outcome.images[0]
     return np. array(result)
