@@ -38,23 +38,99 @@ static bool file_exists(const char* path) {
     return stat(path, &st) == 0;
 }
 
-// --- Helper: heuristic check if output file looks "complete" ---
-//     (We treat a file as complete if it opens, has streams, and a valid duration)
-static bool is_output_complete(const char* path) {
+// Returns true if file looks complete within allowed tail loss.
+// max_loss_ms: allowed missing tail in milliseconds (e.g. 2000 = allow up to 2s missing).
+// Behavior:
+//  - Opens file, finds stream info, requires at least one video stream.
+//  - Probes up to probe_packet_read_limit packets and records the largest packet PTS per stream.
+//  - If container reports duration, compares reported end time to largest observed packet PTS for video stream.
+//    Accepts file when (reported_end - observed_last_packet) <= max_loss_ms.
+//  - If duration is unknown, accepts when we observe at least one video packet (fragmented mp4/mkv case).
+//  - Performs an optional seek-check near end only when duration is known and the observed gap is slightly larger than tolerance.
+static bool is_output_complete(const char* path, int64_t max_loss_ms = 500) {
+    if (!path) return false;
+
     AVFormatContext* fmt = nullptr;
-    if (avformat_open_input(&fmt, path, nullptr, nullptr) != 0)
-        return false;
-    bool ok = false;
-    if (avformat_find_stream_info(fmt, nullptr) >= 0 && fmt->duration > 0) {
-        for (unsigned i = 0; i < fmt->nb_streams; ++i) {
-            if (fmt->streams[i]->codecpar->codec_type == AVMEDIA_TYPE_VIDEO) {
-                ok = true;
-                break;
-            }
+    int ret = avformat_open_input(&fmt, path, nullptr, nullptr);
+    if (ret < 0) return false;
+    auto fmt_guard = MakeGuard(&fmt, avformat_close_input);
+
+    if ((ret = avformat_find_stream_info(fmt, nullptr)) < 0) return false;
+    if (fmt->nb_streams == 0) return false;
+
+    // Find primary video stream (choose first video stream)
+    int video_idx = -1;
+    for (unsigned i = 0; i < fmt->nb_streams; ++i) {
+        if (fmt->streams[i]->codecpar && fmt->streams[i]->codecpar->codec_type == AVMEDIA_TYPE_VIDEO) {
+            video_idx = (int)i;
+            break;
         }
     }
-    avformat_close_input(&fmt);
-    return ok;
+    if (video_idx < 0) return false;
+
+    // Prepare probe: scan up to N packets and record max packet PTS (in stream timebase) for the video stream.
+    const int probe_packet_read_limit = 1000;
+    AVPacket pkt{};
+    //av_init_packet(&pkt);
+    int packets_read = 0;
+    int64_t max_pkt_pts_video = AV_NOPTS_VALUE;
+    while (packets_read < probe_packet_read_limit && (ret = av_read_frame(fmt, &pkt)) >= 0) {
+        if (pkt.stream_index == video_idx) {
+            if (pkt.pts != AV_NOPTS_VALUE) {
+                if (max_pkt_pts_video == AV_NOPTS_VALUE || pkt.pts > max_pkt_pts_video)
+                    max_pkt_pts_video = pkt.pts;
+            }
+            else if (pkt.dts != AV_NOPTS_VALUE) {
+                if (max_pkt_pts_video == AV_NOPTS_VALUE || pkt.dts > max_pkt_pts_video)
+                    max_pkt_pts_video = pkt.dts;
+            }
+        }
+        ++packets_read;
+        av_packet_unref(&pkt);
+    }
+    if (ret < 0 && ret != AVERROR_EOF) return false;
+
+    // If we didn't observe any video packet during probe and duration unknown -> consider incomplete
+    if (max_pkt_pts_video == AV_NOPTS_VALUE && fmt->duration == AV_NOPTS_VALUE) return false;
+
+    // Convert observed last packet PTS to microseconds
+    int64_t observed_last_us = AV_NOPTS_VALUE;
+    if (max_pkt_pts_video != AV_NOPTS_VALUE) {
+        observed_last_us = av_rescale_q(max_pkt_pts_video,
+            fmt->streams[video_idx]->time_base,
+            AVRational{ 1, AV_TIME_BASE });
+    }
+
+    // If container reports duration, compare and allow tolerance
+    if (fmt->duration != AV_NOPTS_VALUE && fmt->duration > 0) {
+        int64_t container_duration_us = fmt->duration; // already in AV_TIME_BASE units (microseconds)
+        // If no observed packets, rely on duration (accept only if duration > 0 and small files)
+        if (observed_last_us == AV_NOPTS_VALUE) {
+            // we probed but didn't see video packets; treat as suspicious => incomplete
+            return false;
+        }
+        int64_t gap_us = container_duration_us - observed_last_us;
+        // If observed_last_us can be slightly greater than duration due to rounding, clamp
+        if (gap_us < 0) gap_us = 0;
+        if (gap_us <= max_loss_ms * 1000) {
+            return true;
+        }
+        // If gap is slightly larger than tolerance, perform a seek/read near end to verify presence of late packets.
+        const int64_t verify_seek_back_us = (max_loss_ms + 1000) * 1000; // seek ~ (tolerance + 1s) back
+        int64_t seek_target_us = container_duration_us > verify_seek_back_us ? container_duration_us - verify_seek_back_us : 0;
+        AVRational tb_time = { 1, AV_TIME_BASE };
+        int64_t target_ts = av_rescale_q(seek_target_us, tb_time, fmt->streams[video_idx]->time_base);
+        if (av_seek_frame(fmt, video_idx, target_ts, AVSEEK_FLAG_BACKWARD) < 0) return false;
+        //av_init_packet(&pkt);
+        pkt = {};
+        if (av_read_frame(fmt, &pkt) < 0) return false;
+        bool got_video_after_seek = (pkt.stream_index == video_idx);
+        av_packet_unref(&pkt);
+        return got_video_after_seek;
+    }
+
+    // If duration unknown (fragmented/streaming-friendly file), accept if we observed at least one video packet
+    return (observed_last_us != AV_NOPTS_VALUE);
 }
 
 // ============================================================================
