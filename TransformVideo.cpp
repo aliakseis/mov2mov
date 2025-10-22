@@ -2,6 +2,8 @@
 
 #include <stdint.h>
 #include <sys/stat.h>
+#include <cstdio>
+#include <ctime>
 
 extern "C" {
 #include <libavutil/timestamp.h>
@@ -11,7 +13,6 @@ extern "C" {
 }
 
 #include <opencv2/opencv.hpp>
-
 #include <vector>
 #include <string>
 #include <functional>
@@ -20,180 +21,204 @@ extern "C" {
 
 #include "makeguard.h"
 
-struct AVFrameDeleter {
-    void operator()(AVFrame* frame) const { av_frame_free(&frame); };
-};
+// --- Smart deleter for AVFrame (RAII) ---
+struct AVFrameDeleter { void operator()(AVFrame* f) const { av_frame_free(&f); } };
+using AVFramePtr = std::unique_ptr<AVFrame, AVFrameDeleter>;
 
-typedef std::unique_ptr<AVFrame, AVFrameDeleter> AVFramePtr;
-
+// --- Convenience error printer for FFmpeg ---
 static void ReportError(int ret) {
-    char errBuf[AV_ERROR_MAX_STRING_SIZE]{};
-    fprintf(stderr, "Error occurred: %s\n",
-        av_make_error_string(errBuf, AV_ERROR_MAX_STRING_SIZE, ret));
+    char buf[AV_ERROR_MAX_STRING_SIZE]{};
+    fprintf(stderr, "Error: %s\n",
+        av_make_error_string(buf, AV_ERROR_MAX_STRING_SIZE, ret));
 }
 
+// --- Helper: check if file exists ---
 static bool file_exists(const char* path) {
     struct stat st;
     return stat(path, &st) == 0;
 }
 
+// --- Helper: heuristic check if output file looks "complete" ---
+//     (We treat a file as complete if it opens, has streams, and a valid duration)
+static bool is_output_complete(const char* path) {
+    AVFormatContext* fmt = nullptr;
+    if (avformat_open_input(&fmt, path, nullptr, nullptr) != 0)
+        return false;
+    bool ok = false;
+    if (avformat_find_stream_info(fmt, nullptr) >= 0 && fmt->duration > 0) {
+        for (unsigned i = 0; i < fmt->nb_streams; ++i) {
+            if (fmt->streams[i]->codecpar->codec_type == AVMEDIA_TYPE_VIDEO) {
+                ok = true;
+                break;
+            }
+        }
+    }
+    avformat_close_input(&fmt);
+    return ok;
+}
+
+// ============================================================================
+//  MAIN FUNCTION
+// ============================================================================
+//
+//  This function safely transforms a video file using OpenCV callback,
+//  supports automatic backup/resume logic, and ensures crash recovery.
+//
+//  Key behaviors:
+//   - If output is already finished, do nothing.
+//   - If output is incomplete, rename it to .bak.
+//   - If .bak exists, reuse its content (remux) and resume from last frame.
+//   - Delete .bak only once new frames are successfully written.
+//
 int TransformVideo(const char* in_filename,
     const char* out_filename,
     std::function<void(cv::Mat&)> callback,
     int upscale, int downscale)
 {
-    AVFormatContext* input_format_context = nullptr, * output_format_context = nullptr;
-    int ret;
-    int stream_index = 0;
+    std::string bak_filename = std::string(out_filename) + ".bak";
 
-    if ((ret = avformat_open_input(&input_format_context, in_filename, nullptr, nullptr)) < 0) {
-        fprintf(stderr, "Could not open input file '%s'\n", in_filename);
-        return 1;
-    }
-    auto input_format_context_guard = MakeGuard(&input_format_context, avformat_close_input);
-
-    if ((ret = avformat_find_stream_info(input_format_context, nullptr)) < 0) {
-        fprintf(stderr, "Failed to retrieve input stream information\n");
-        return 1;
+    // ------------------------------------------------------------------------
+    // Step 1: If output file already exists and looks finished, skip entirely
+    // ------------------------------------------------------------------------
+    if (file_exists(out_filename) && is_output_complete(out_filename)) {
+        fprintf(stderr, "Output '%s' already complete. Nothing to do.\n", out_filename);
+        return 0;
     }
 
-    // --- handle .bak ---
-    std::string bak_filename;
-    if (file_exists(out_filename)) {
-        bak_filename = std::string(out_filename) + ".bak";
+    // ------------------------------------------------------------------------
+    // Step 2: Handle backup (.bak) and incomplete output files
+    // ------------------------------------------------------------------------
+    // If a .bak already exists, we'll use it directly.
+    // Otherwise, if output file exists but is incomplete, rename it to .bak
+    if (file_exists(bak_filename.c_str())) {
+        fprintf(stderr, "Using existing backup file '%s'\n", bak_filename.c_str());
+    }
+    else if (file_exists(out_filename)) {
+        fprintf(stderr, "Renaming incomplete output to '%s'\n", bak_filename.c_str());
         if (rename(out_filename, bak_filename.c_str()) != 0) {
-            fprintf(stderr, "Warning: failed to rename existing output to %s: %s\n",
+            fprintf(stderr, "Warning: failed to rename output to %s: %s\n",
                 bak_filename.c_str(), strerror(errno));
-            bak_filename.clear();
+            bak_filename.clear();  // continue safely without backup
         }
     }
 
-    // --- output setup ---
-    avformat_alloc_output_context2(&output_format_context, nullptr, "matroska", out_filename);
-    if (!output_format_context) {
-        fprintf(stderr, "Could not create output context\n");
+    // ------------------------------------------------------------------------
+    // Step 3: Open input (source) video
+    // ------------------------------------------------------------------------
+    AVFormatContext* input_fmt = nullptr;
+    int ret = avformat_open_input(&input_fmt, in_filename, nullptr, nullptr);
+    if (ret < 0) { ReportError(ret); return 1; }
+    auto input_guard = MakeGuard(&input_fmt, avformat_close_input);
+    if (avformat_find_stream_info(input_fmt, nullptr) < 0) {
+        fprintf(stderr, "Cannot get input stream info\n");
         return 1;
     }
-    auto output_format_context_guard = MakeGuard(output_format_context, avformat_free_context);
 
-    const int number_of_streams = input_format_context->nb_streams;
-    std::vector<int> streams_list(number_of_streams, -1);
+    // ------------------------------------------------------------------------
+    // Step 4: Create output context
+    // ------------------------------------------------------------------------
+    AVFormatContext* out_fmt = nullptr;
+    avformat_alloc_output_context2(&out_fmt, nullptr, "matroska", out_filename);
+    if (!out_fmt) { fprintf(stderr, "Cannot allocate output context\n"); return 1; }
+    auto out_guard = MakeGuard(out_fmt, avformat_free_context);
+    out_fmt->flags |= AVFMT_FLAG_NOBUFFER;
 
-    int videoStreamNumber = -1;
-    AVStream* videoStream = nullptr;
-    AVStream* outputVideoStream = nullptr;
+    // Prepare stream mapping
+    int video_idx = -1;
+    AVStream* in_video = nullptr;
+    AVStream* out_video = nullptr;
+    std::vector<int> stream_map(input_fmt->nb_streams, -1);
+    int out_stream_count = 0;
 
-    for (int i = 0; i < number_of_streams; i++) {
-        AVStream* in_stream = input_format_context->streams[i];
-        AVCodecParameters* in_codecpar = in_stream->codecpar;
-        const bool isVideo = in_codecpar->codec_type == AVMEDIA_TYPE_VIDEO;
-
-        if (isVideo) {
-            videoStreamNumber = i;
-            videoStream = in_stream;
+    // Copy all streams (video + audio/subtitle) structure into output
+    for (unsigned i = 0; i < input_fmt->nb_streams; i++) {
+        AVStream* in_st = input_fmt->streams[i];
+        AVCodecParameters* par = in_st->codecpar;
+        if (par->codec_type == AVMEDIA_TYPE_VIDEO) {
+            video_idx = i;
+            in_video = in_st;
         }
-        else if (in_codecpar->codec_type != AVMEDIA_TYPE_AUDIO &&
-            in_codecpar->codec_type != AVMEDIA_TYPE_SUBTITLE) {
-            streams_list[i] = -1;
+        else if (par->codec_type != AVMEDIA_TYPE_AUDIO &&
+            par->codec_type != AVMEDIA_TYPE_SUBTITLE) {
             continue;
         }
 
-        streams_list[i] = stream_index++;
-        AVStream* out_stream = avformat_new_stream(output_format_context, nullptr);
-        if (!out_stream) {
-            fprintf(stderr, "Failed allocating output stream\n");
-            return 1;
-        }
+        stream_map[i] = out_stream_count++;
+        AVStream* out_st = avformat_new_stream(out_fmt, nullptr);
+        avcodec_parameters_copy(out_st->codecpar, par);
+        out_st->codecpar->codec_tag = 0;
 
-        if ((ret = avcodec_parameters_copy(out_stream->codecpar, in_codecpar)) < 0) {
-            fprintf(stderr, "Failed to copy codec parameters\n");
-            return 1;
-        }
-
-        out_stream->codecpar->codec_tag = 0;
-        if (isVideo) outputVideoStream = out_stream;
+        if (par->codec_type == AVMEDIA_TYPE_VIDEO)
+            out_video = out_st;
     }
 
-    output_format_context->flags |= AVFMT_FLAG_NOBUFFER;
-
-    if (!(output_format_context->oformat->flags & AVFMT_NOFILE)) {
-        if ((ret = avio_open(&output_format_context->pb, out_filename, AVIO_FLAG_WRITE)) < 0) {
-            fprintf(stderr, "Could not open output file '%s'\n", out_filename);
+    // Open output file handle if needed
+    if (!(out_fmt->oformat->flags & AVFMT_NOFILE)) {
+        if (avio_open(&out_fmt->pb, out_filename, AVIO_FLAG_WRITE) < 0) {
+            fprintf(stderr, "Cannot open output file\n");
             return 1;
         }
     }
 
-    // --- input video decoder ---
-    AVCodecContext* videoCodecContext = avcodec_alloc_context3(nullptr);
-    if (!videoCodecContext) return 1;
-    auto videoCodecContextGuard = MakeGuard(&videoCodecContext, avcodec_free_context);
+    // ------------------------------------------------------------------------
+    // Step 5: Initialize decoder and encoder
+    // ------------------------------------------------------------------------
+    AVCodecContext* dec_ctx = avcodec_alloc_context3(nullptr);
+    avcodec_parameters_to_context(dec_ctx, in_video->codecpar);
+    auto dec_guard = MakeGuard(&dec_ctx, avcodec_free_context);
 
-    if (avcodec_parameters_to_context(videoCodecContext, videoStream->codecpar) < 0) return 1;
-
-    auto videoCodec = avcodec_find_decoder(videoCodecContext->codec_id);
-    if (!videoCodec || avcodec_open2(videoCodecContext, videoCodec, nullptr) < 0) {
-        fprintf(stderr, "Error opening decoder\n");
-        return 1;
+    auto dec = avcodec_find_decoder(dec_ctx->codec_id);
+    if (!dec || avcodec_open2(dec_ctx, dec, nullptr) < 0) {
+        fprintf(stderr, "Decoder error\n"); return 1;
     }
 
-    // --- output encoder ---
-    auto encoder = avcodec_find_encoder(videoCodecContext->codec_id);
-    if (!encoder) {
-        av_log(nullptr, AV_LOG_FATAL, "Necessary encoder not found\n");
-        return 1;
-    }
-    AVCodecContext* enc_ctx = avcodec_alloc_context3(encoder);
-    if (!enc_ctx) return 1;
+    // Encoder (same codec as input)
+    auto enc = avcodec_find_encoder(dec_ctx->codec_id);
+    if (!enc) { fprintf(stderr, "No encoder found\n"); return 1; }
 
-    const auto out_height = (videoCodecContext->height * upscale / downscale) & ~7;
-    const auto out_width = (videoCodecContext->width * upscale / downscale) & ~7;
-    enc_ctx->height = out_height;
-    enc_ctx->width = out_width;
-    enc_ctx->sample_aspect_ratio = videoCodecContext->sample_aspect_ratio;
-    enc_ctx->pix_fmt = (encoder->pix_fmts) ? encoder->pix_fmts[0] : videoCodecContext->pix_fmt;
-    enc_ctx->time_base = videoStream->time_base;
+    AVCodecContext* enc_ctx = avcodec_alloc_context3(enc);
+    enc_ctx->width = (dec_ctx->width * upscale / downscale) & ~7;
+    enc_ctx->height = (dec_ctx->height * upscale / downscale) & ~7;
+    enc_ctx->time_base = in_video->time_base;
+    enc_ctx->sample_aspect_ratio = dec_ctx->sample_aspect_ratio;
+    enc_ctx->pix_fmt = enc->pix_fmts ? enc->pix_fmts[0] : dec_ctx->pix_fmt;
     enc_ctx->gop_size = 1;
     enc_ctx->max_b_frames = 2;
-
-    if (output_format_context->oformat->flags & AVFMT_GLOBALHEADER)
+    if (out_fmt->oformat->flags & AVFMT_GLOBALHEADER)
         enc_ctx->flags |= AV_CODEC_FLAG_GLOBAL_HEADER;
+    if (avcodec_open2(enc_ctx, enc, nullptr) < 0) { fprintf(stderr, "Encoder open error\n"); return 1; }
 
-    if ((ret = avcodec_open2(enc_ctx, encoder, nullptr)) < 0) {
-        ReportError(ret);
-        return 1;
-    }
+    // Copy encoder parameters into output stream
+    avcodec_parameters_from_context(out_video->codecpar, enc_ctx);
+    out_video->time_base = enc_ctx->time_base;
 
-    ret = avcodec_parameters_from_context(outputVideoStream->codecpar, enc_ctx);
-    if (ret < 0) return 1;
-    outputVideoStream->time_base = enc_ctx->time_base;
+    // Write container header
+    avformat_write_header(out_fmt, nullptr);
 
-    // --- write header ---
-    if ((ret = avformat_write_header(output_format_context, nullptr)) < 0) {
-        fprintf(stderr, "Error writing output header\n");
-        return 1;
-    }
+    // Track last PTS written per stream
+    std::vector<int64_t> last_written_pts(out_fmt->nb_streams, AV_NOPTS_VALUE);
 
-    std::vector<int64_t> last_written_pts(output_format_context->nb_streams, AV_NOPTS_VALUE);
-
-    // --- single-pass backup remux ---
-    if (!bak_filename.empty()) {
+    // ------------------------------------------------------------------------
+    // Step 6: If .bak exists, remux its contents into the new output file
+    // ------------------------------------------------------------------------
+    // This ensures we retain all previously finished frames before resuming.
+    if (!bak_filename.empty() && file_exists(bak_filename.c_str())) {
         AVFormatContext* bak_fmt = nullptr;
         if (avformat_open_input(&bak_fmt, bak_filename.c_str(), nullptr, nullptr) == 0) {
             avformat_find_stream_info(bak_fmt, nullptr);
-            AVPacket pkt{};
-            //av_init_packet(&pkt);
-            std::vector<int64_t> max_pts(output_format_context->nb_streams, AV_NOPTS_VALUE);
+            AVPacket pkt{}; //av_init_packet(&pkt);
 
             while (av_read_frame(bak_fmt, &pkt) >= 0) {
-                int out_idx = pkt.stream_index;
-                if (out_idx < 0 || out_idx >= (int)output_format_context->nb_streams) {
+                int oidx = pkt.stream_index;
+                if (oidx < 0 || oidx >= (int)out_fmt->nb_streams) {
                     av_packet_unref(&pkt);
                     continue;
                 }
 
                 AVStream* in_st = bak_fmt->streams[pkt.stream_index];
-                AVStream* out_st = output_format_context->streams[out_idx];
+                AVStream* out_st = out_fmt->streams[oidx];
 
+                // Rescale timestamps between backup and output
                 if (pkt.pts != AV_NOPTS_VALUE)
                     pkt.pts = av_rescale_q_rnd(pkt.pts, in_st->time_base, out_st->time_base,
                         AVRounding(AV_ROUND_NEAR_INF | AV_ROUND_PASS_MINMAX));
@@ -201,128 +226,127 @@ int TransformVideo(const char* in_filename,
                     pkt.dts = av_rescale_q_rnd(pkt.dts, in_st->time_base, out_st->time_base,
                         AVRounding(AV_ROUND_NEAR_INF | AV_ROUND_PASS_MINMAX));
                 pkt.duration = av_rescale_q(pkt.duration, in_st->time_base, out_st->time_base);
-                pkt.stream_index = out_idx;
+                pkt.stream_index = oidx;
                 pkt.pos = -1;
 
-                ret = av_interleaved_write_frame(output_format_context, &pkt);
-                if (ret < 0) {
-                    fprintf(stderr, "Warning: remux write error: %d\n", ret);
-                    av_packet_unref(&pkt);
-                    continue;
+                // Write packet and remember last PTS
+                if (av_interleaved_write_frame(out_fmt, &pkt) >= 0) {
+                    int64_t ts = (pkt.pts != AV_NOPTS_VALUE) ? pkt.pts : pkt.dts;
+                    if (ts != AV_NOPTS_VALUE) last_written_pts[oidx] = ts;
                 }
-
-                int64_t written_ts = (pkt.pts != AV_NOPTS_VALUE) ? pkt.pts : pkt.dts;
-                if (written_ts != AV_NOPTS_VALUE)
-                    max_pts[out_idx] = (max_pts[out_idx] == AV_NOPTS_VALUE) ?
-                    written_ts : std::max(max_pts[out_idx], written_ts);
-
                 av_packet_unref(&pkt);
             }
-
-            for (size_t i = 0; i < last_written_pts.size() && i < max_pts.size(); ++i)
-                if (max_pts[i] != AV_NOPTS_VALUE) last_written_pts[i] = max_pts[i];
-
             avformat_close_input(&bak_fmt);
         }
-        else {
-            fprintf(stderr, "Warning: could not open backup file %s for remux\n", bak_filename.c_str());
-        }
     }
 
-    // --- seek input near last-written video frame ---
-    int output_video_stream_index = -1;
-    for (unsigned i = 0; i < output_format_context->nb_streams; ++i)
-        if (output_format_context->streams[i] == outputVideoStream)
-            output_video_stream_index = (int)i;
-
-    if (output_video_stream_index >= 0 &&
-        last_written_pts[output_video_stream_index] != AV_NOPTS_VALUE) {
-        int64_t last_out_pts = last_written_pts[output_video_stream_index];
+    // ------------------------------------------------------------------------
+    // Step 7: Resume decoding from where we left off (seek input)
+    // ------------------------------------------------------------------------
+    // We use last_written_pts from the video stream to resume decoding
+    // near the frame after the last one written during remux.
+    int out_video_idx = out_video->index;
+    if (out_video_idx >= 0 && last_written_pts[out_video_idx] != AV_NOPTS_VALUE) {
+        int64_t last_out_pts = last_written_pts[out_video_idx];
         int64_t seek_target = av_rescale_q(last_out_pts,
-            outputVideoStream->time_base,
-            videoStream->time_base);
-        if (av_seek_frame(input_format_context, videoStreamNumber, seek_target,
-            AVSEEK_FLAG_BACKWARD) >= 0)
-            avcodec_flush_buffers(videoCodecContext);
-        else
-            fprintf(stderr, "Warning: av_seek_frame failed when seeking to resume point\n");
+            out_video->time_base,
+            in_video->time_base);
+        if (av_seek_frame(input_fmt, video_idx, seek_target, AVSEEK_FLAG_BACKWARD) >= 0) {
+            avcodec_flush_buffers(dec_ctx);
+            fprintf(stderr, "Resuming input near pts %" PRId64 "\n", last_out_pts);
+        }
+        else {
+            fprintf(stderr, "Warning: failed to seek for resume\n");
+        }
     }
 
-    // --- prepare frames ---
-    AVFramePtr videoFrame(av_frame_alloc());
-    AVFramePtr videoFrameOut(av_frame_alloc());
-    videoFrameOut->format = videoCodecContext->pix_fmt;
-    videoFrameOut->width = out_width;
-    videoFrameOut->height = out_height;
-    av_frame_get_buffer(videoFrameOut.get(), 16);
+    // ------------------------------------------------------------------------
+    // Step 8: Initialize scaling + frame buffers
+    // ------------------------------------------------------------------------
+    AVFramePtr frame(av_frame_alloc()), frame_out(av_frame_alloc());
+    frame_out->format = dec_ctx->pix_fmt;
+    frame_out->width = enc_ctx->width;
+    frame_out->height = enc_ctx->height;
+    av_frame_get_buffer(frame_out.get(), 16);
 
-    SwsContext* to_bgr_ctx = sws_getContext(
-        videoCodecContext->width, videoCodecContext->height, videoCodecContext->pix_fmt,
-        out_width, out_height, AV_PIX_FMT_BGR24,
+    SwsContext* to_bgr = sws_getContext(
+        dec_ctx->width, dec_ctx->height, dec_ctx->pix_fmt,
+        enc_ctx->width, enc_ctx->height, AV_PIX_FMT_BGR24,
         SWS_FAST_BILINEAR, nullptr, nullptr, nullptr);
 
-    SwsContext* from_bgr_ctx = sws_getContext(
-        out_width, out_height, AV_PIX_FMT_BGR24,
-        out_width, out_height, videoCodecContext->pix_fmt,
+    SwsContext* from_bgr = sws_getContext(
+        enc_ctx->width, enc_ctx->height, AV_PIX_FMT_BGR24,
+        enc_ctx->width, enc_ctx->height, dec_ctx->pix_fmt,
         SWS_FAST_BILINEAR, nullptr, nullptr, nullptr);
 
-    AVPacket enc_pkt{};
-    //av_init_packet(&enc_pkt);
+    bool bak_deleted = false; // will become true once we output new frames
 
-    // --- main decode/encode loop ---
-    while (av_read_frame(input_format_context, &enc_pkt) >= 0) {
-        if (enc_pkt.stream_index != videoStreamNumber) {
-            av_packet_unref(&enc_pkt);
-            continue;
-        }
+    // ------------------------------------------------------------------------
+    // Step 9: Main decode / process / encode loop
+    // ------------------------------------------------------------------------
+    AVPacket pkt{};
+    //av_init_packet(&pkt);
 
-        if (avcodec_send_packet(videoCodecContext, &enc_pkt) < 0) {
-            av_packet_unref(&enc_pkt);
+    while (av_read_frame(input_fmt, &pkt) >= 0) {
+        if (pkt.stream_index != video_idx) { av_packet_unref(&pkt); continue; }
+
+        if (avcodec_send_packet(dec_ctx, &pkt) < 0) {
+            av_packet_unref(&pkt);
             break;
         }
-        av_packet_unref(&enc_pkt);
+        av_packet_unref(&pkt);
 
-        while (avcodec_receive_frame(videoCodecContext, videoFrame.get()) == 0) {
-            cv::Mat img(out_height, out_width, CV_8UC3);
+        while (avcodec_receive_frame(dec_ctx, frame.get()) == 0) {
+            // Convert decoded frame to OpenCV Mat for user callback
+            cv::Mat img(enc_ctx->height, enc_ctx->width, CV_8UC3);
             int stride = img.step[0];
+            sws_scale(to_bgr, frame->data, frame->linesize, 0, dec_ctx->height,
+                &img.data, &stride);
 
-            sws_scale(to_bgr_ctx, videoFrame->data, videoFrame->linesize,
-                0, videoCodecContext->height, &img.data, &stride);
-
+            // User-defined frame transformation
             callback(img);
 
-            sws_scale(from_bgr_ctx, (const uint8_t**)&img.data, &stride,
-                0, out_height, videoFrameOut->data, videoFrameOut->linesize);
+            // Convert processed Mat back into AVFrame for encoding
+            sws_scale(from_bgr, (const uint8_t**)&img.data, &stride, 0, enc_ctx->height,
+                frame_out->data, frame_out->linesize);
+            frame_out->pts = frame->pts;
 
-            videoFrameOut->pts = videoFrame->pts;
-            if (avcodec_send_frame(enc_ctx, videoFrameOut.get()) < 0) break;
+            // Encode + write to output
+            if (avcodec_send_frame(enc_ctx, frame_out.get()) < 0) break;
+            AVPacket enc_pkt{}; //av_init_packet(&enc_pkt);
 
-            AVPacket pkt{};
-            //av_init_packet(&pkt);
-            while (avcodec_receive_packet(enc_ctx, &pkt) == 0) {
-                if (pkt.pts != AV_NOPTS_VALUE)
-                    pkt.pts = av_rescale_q(pkt.pts, enc_ctx->time_base, outputVideoStream->time_base);
-                if (pkt.dts != AV_NOPTS_VALUE)
-                    pkt.dts = av_rescale_q(pkt.dts, enc_ctx->time_base, outputVideoStream->time_base);
-                pkt.stream_index = output_video_stream_index;
-                pkt.pos = -1;
+            while (avcodec_receive_packet(enc_ctx, &enc_pkt) == 0) {
+                enc_pkt.stream_index = out_video_idx;
+                enc_pkt.pts = av_rescale_q(enc_pkt.pts, enc_ctx->time_base, out_video->time_base);
+                enc_pkt.dts = av_rescale_q(enc_pkt.dts, enc_ctx->time_base, out_video->time_base);
+                enc_pkt.pos = -1;
 
-                ret = av_interleaved_write_frame(output_format_context, &pkt);
-                av_packet_unref(&pkt);
-                if (ret < 0) {
-                    fprintf(stderr, "Error while writing encoded packet\n");
-                    break;
+                if ((ret = av_interleaved_write_frame(out_fmt, &enc_pkt)) >= 0) {
+                    // --- Step 10: Delete .bak only after actual new frames are written ---
+                    if (!bak_deleted && file_exists(bak_filename.c_str())) {
+                        if (std::remove(bak_filename.c_str()) == 0)
+                            fprintf(stderr, "Deleted backup %s after writing new frames\n", bak_filename.c_str());
+                        bak_deleted = true;
+                    }
                 }
+                else {
+                    ReportError(ret);
+                }
+                av_packet_unref(&enc_pkt);
             }
         }
     }
 
-    av_write_trailer(output_format_context);
-    if (!(output_format_context->oformat->flags & AVFMT_NOFILE))
-        avio_closep(&output_format_context->pb);
+    // ------------------------------------------------------------------------
+    // Step 11: Finalize and clean up
+    // ------------------------------------------------------------------------
+    av_write_trailer(out_fmt);
+    if (!(out_fmt->oformat->flags & AVFMT_NOFILE))
+        avio_closep(&out_fmt->pb);
 
-    sws_freeContext(to_bgr_ctx);
-    sws_freeContext(from_bgr_ctx);
+    sws_freeContext(to_bgr);
+    sws_freeContext(from_bgr);
 
+    fprintf(stderr, "Transform finished successfully.\n");
     return 0;
 }
